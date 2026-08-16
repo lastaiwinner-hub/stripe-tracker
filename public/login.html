@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stripe Tracker — Sign in</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='80' font-size='80'>💳</text></svg>">
+</head>
+<body class="login-body">
+  <div class="login-wrap">
+    <div class="login-card">
+      <div class="login-brand">💳 <span>Stripe Tracker</span></div>
+
+      <div id="mode-note" class="login-note"></div>
+
+      <form id="form" autocomplete="off">
+        <label for="email">Email</label>
+        <input type="email" id="email" autocomplete="username" required>
+
+        <label id="pw-label" for="pw">Password</label>
+        <input type="password" id="pw" autocomplete="current-password" required>
+
+        <div id="confirm-row" hidden>
+          <label for="pw2">Confirm password</label>
+          <input type="password" id="pw2" autocomplete="new-password">
+        </div>
+
+        <button class="btn" id="go" type="submit">Sign in</button>
+        <div id="msg" class="login-msg"></div>
+      </form>
+    </div>
+  </div>
+  <script src="login.js"></script>
+</body>
+</html>

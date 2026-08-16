@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stripe Tracker</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='80' font-size='80'>💳</text></svg>">
+</head>
+<body>
+  <header>
+    <div class="brand">💳 <span>Stripe Tracker</span></div>
+    <nav>
+      <button class="tab" data-tab="structure">Accounts</button>
+      <button class="tab" data-tab="alerts">Alerts</button>
+      <button class="tab" data-tab="settings">Settings</button>
+    </nav>
+    <div class="head-right">
+      <div id="poll-chip" class="chip">⏳ idle</div>
+      <div id="tg-chip" class="chip">⚪ telegram: off</div>
+      <div id="sheet-chip" class="chip">⚪ sheet: off</div>
+      <button id="logout" class="chip" title="Sign out">⎋ sign out</button>
+    </div>
+  </header>
+
+  <main id="view"></main>
+
+  <div id="toast"></div>
+  <script src="app.js"></script>
+</body>
+</html>
