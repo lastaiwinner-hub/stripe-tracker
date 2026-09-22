@@ -254,7 +254,8 @@ function renderStructure() {
       const r = await api('POST', '/poll');
       await refresh();
       const failed = r.results.filter((x) => x.ok === false).length;
-      toast(`Checked ${r.results.length} account(s)${failed ? `, ${failed} failed` : ''}. Telegram sent ${r.telegram.sent || 0}.`);
+      const sent = (r.telegram.sent || 0) + (r.telegram.summary?.sent || 0);
+      toast(`Checked ${r.results.length} account(s)${failed ? `, ${failed} failed` : ''}. Telegram sent ${sent}.`);
     } catch (e) { toast(e.message, true); btn.disabled = false; btn.textContent = '⟳ Check all now'; }
   };
 

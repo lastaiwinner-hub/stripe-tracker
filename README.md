@@ -107,6 +107,12 @@ The only genuinely shared setting is **how often the server checks Stripe** (`po
 
 ## Telegram setup (2 min)
 
+When you press **Check all now**, the tracker sends one payout summary after
+the check finishes. It lists each healthy, payout-enabled account with its next
+payout amount, status, expected bank date, method and destination. When Stripe
+has no upcoming payout, it shows the latest payout instead. Automatic payout
+alerts also include the amount, status, start date and bank-arrival date.
+
 1. In Telegram open [@BotFather](https://t.me/BotFather) → `/newbot` → pick a name.
 2. Paste the token it gives you into Settings → **Save token**.
 3. Open your bot's chat and press **Start**.

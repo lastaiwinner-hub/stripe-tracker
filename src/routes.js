@@ -264,10 +264,13 @@ router.post('/accounts/:id/poll', safe(async (req, res) => {
 
 /** "Check all now" only checks your own accounts. */
 router.post('/poll', safe(async (req, res) => {
-  const results = await stripe.pollUser(uid(req));
+  const me = uid(req);
+  const results = await stripe.pollUser(me);
   const tg = await telegram.flush().catch((e) => ({ sent: 0, error: e.message }));
-  await sheets.maybeAutoPush(uid(req)).catch(() => {});
-  res.json({ results, telegram: tg });
+  const summary = await telegram.sendPayoutSummary(me, results)
+    .catch((e) => ({ sent: 0, error: e.message }));
+  await sheets.maybeAutoPush(me).catch(() => {});
+  res.json({ results, telegram: { ...tg, summary } });
 }));
 
 router.post('/poll/toggle', safe((req, res) => {

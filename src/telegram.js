@@ -96,6 +96,46 @@ function formatEvent(ev) {
   return lines.join('\n');
 }
 
+function formatPayoutSummary(results) {
+  const working = (results || []).filter((r) => r.ok && r.health === 'healthy' && r.payouts_enabled);
+  const lines = ['🏦 <b>Payout summary — working accounts</b>'];
+
+  if (!working.length) {
+    lines.push('No healthy, payout-enabled accounts were found.');
+    return lines.join('\n');
+  }
+
+  for (const r of working) {
+    const label = esc(r.label || `Account ${r.id}`);
+    const p = r.payout;
+    if (!p) {
+      const note = r.payout_error ? `Payout details unavailable: ${esc(r.payout_error)}` : 'No payout is currently scheduled.';
+      lines.push(`\n✅ <b>${label}</b>\n${note}`);
+      continue;
+    }
+    const amount = `${Number(p.amount).toLocaleString('en-US', { maximumFractionDigits: 2 })} ${esc(String(p.currency).toUpperCase())}`;
+    const when = p.arrival_date
+      ? new Intl.DateTimeFormat('en-GB', { timeZone: 'UTC', day: '2-digit', month: 'short', year: 'numeric' }).format(new Date(p.arrival_date * 1000))
+      : 'date not supplied by Stripe';
+    const status = String(p.status).replace(/_/g, ' ');
+    lines.push(
+      `\n✅ <b>${label}</b>`,
+      `${p.is_upcoming ? 'Next payout' : 'Latest payout'}: <b>${amount}</b>`,
+      `Status: ${esc(status)} · Bank date: <b>${esc(when)}</b>`,
+      `Method: ${esc(p.method || 'standard')}${p.destination ? ` · ${esc(p.destination)}` : ''}`
+    );
+  }
+  lines.push('\n<i>Dates are shown in UTC and come directly from Stripe.</i>');
+  return lines.join('\n');
+}
+
+async function sendPayoutSummary(userId, results) {
+  if (!config(userId).ready) return { sent: 0, skipped: 'telegram not connected' };
+  if (!enabledKinds(userId).has('payout')) return { sent: 0, skipped: 'payout alerts muted' };
+  await sendMessage(userId, formatPayoutSummary(results));
+  return { sent: 1 };
+}
+
 async function sendMessage(userId, text) {
   const { token, chatId } = config(userId);
   if (!chatId) throw new Error('No Telegram chat id yet — press Start in your bot chat, then hit Detect.');
@@ -177,4 +217,7 @@ async function flush() {
   return { sent };
 }
 
-module.exports = { config, detectChatId, sendMessage, flush, enabledKinds, tg, ALL_KINDS };
+module.exports = {
+  config, detectChatId, sendMessage, sendPayoutSummary, formatPayoutSummary,
+  flush, enabledKinds, tg, ALL_KINDS,
+};

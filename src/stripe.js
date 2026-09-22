@@ -47,6 +47,36 @@ function money(amount, currency) {
   return `${v.toLocaleString('en-US', { maximumFractionDigits: 2 })} ${String(currency || '').toUpperCase()}`;
 }
 
+function stripeDate(timestamp) {
+  if (!timestamp) return '';
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'UTC', day: '2-digit', month: 'short', year: 'numeric',
+  }).format(new Date(timestamp * 1000));
+}
+
+/** Pick the payout that is still on its way, falling back to the latest one. */
+function payoutSnapshot(payouts) {
+  const list = Array.isArray(payouts) ? payouts : [];
+  const active = list
+    .filter((p) => ['pending', 'in_transit'].includes(p.status))
+    .sort((a, b) => (a.arrival_date || Infinity) - (b.arrival_date || Infinity));
+  const p = active[0] || list[0];
+  if (!p) return null;
+  return {
+    id: p.id,
+    amount: toMajor(p.amount, p.currency),
+    amount_raw: p.amount,
+    currency: p.currency || '',
+    status: p.status || 'unknown',
+    arrival_date: p.arrival_date || null,
+    created: p.created || null,
+    method: p.method || 'standard',
+    type: p.type || '',
+    destination: typeof p.destination === 'string' ? p.destination : (p.destination?.id || ''),
+    is_upcoming: active.includes(p),
+  };
+}
+
 /**
  * Work out an account's health from what Stripe reports.
  * suspended > restricted > docs > pending > healthy
@@ -173,12 +203,24 @@ function describeEvent(ev) {
       }
       break;
     case 'payout.failed':
-      bits.push(`Status: ${o.status}`);
+    case 'payout.canceled':
+      bits.push(`Status: ${o.status || 'unknown'}`);
+      if (o.amount !== undefined) bits.push(`Amount: ${money(o.amount, o.currency)}`);
+      if (o.created) bits.push(`Started: ${stripeDate(o.created)} (UTC)`);
+      if (o.arrival_date) bits.push(`Expected arrival: ${stripeDate(o.arrival_date)} (UTC)`);
+      if (o.method) bits.push(`Method: ${o.method}`);
+      if (o.destination) bits.push(`Destination: ${typeof o.destination === 'string' ? o.destination : o.destination.id}`);
       if (o.failure_message) bits.push(o.failure_message);
+      if (o.failure_code) bits.push(`Failure code: ${o.failure_code}`);
       if (o.failure_balance_transaction) bits.push('Funds returned to your Stripe balance.');
       break;
     case 'payout.paid':
-      if (o.arrival_date) bits.push(`Arrives ${new Date(o.arrival_date * 1000).toDateString()}`);
+      bits.push(`Status: ${o.status || 'paid'}`);
+      if (o.amount !== undefined) bits.push(`Amount: ${money(o.amount, o.currency)}`);
+      if (o.created) bits.push(`Started: ${stripeDate(o.created)} (UTC)`);
+      if (o.arrival_date) bits.push(`Bank arrival: ${stripeDate(o.arrival_date)} (UTC)`);
+      if (o.method) bits.push(`Method: ${o.method}`);
+      if (o.destination) bits.push(`Destination: ${typeof o.destination === 'string' ? o.destination : o.destination.id}`);
       break;
     case 'charge.refunded':
       if (o.amount_refunded) bits.push(`Refunded ${money(o.amount_refunded, o.currency)}`);
@@ -417,6 +459,19 @@ async function pollAccount(acc) {
     live.balance_available = sum(bal.available);
     live.balance_pending = sum(bal.pending);
 
+    // Some restricted keys cannot list payouts. Keep the account healthy and
+    // report that limitation in the summary instead of failing the whole poll.
+    let payout = null;
+    let payout_error = '';
+    if (health === 'healthy' && acct.payouts_enabled) {
+      try {
+        const payouts = await sget(key, '/payouts', { limit: 10 });
+        payout = payoutSnapshot(payouts.data);
+      } catch (e) {
+        payout_error = e.message || String(e);
+      }
+    }
+
     // ---- today's counters (no alerts — those come from /events) ----
     const dayStart = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
     const charges = await sget(key, '/charges', { limit: 100, 'created[gte]': dayStart });
@@ -436,7 +491,13 @@ async function pollAccount(acc) {
 
     d.setSetting(cursorKey, String(Math.max(newCursor, since)));
     d.updateLive(acc.id, live);
-    return { ok: true, health };
+    return {
+      ok: true,
+      health,
+      payouts_enabled: !!acct.payouts_enabled,
+      payout,
+      payout_error,
+    };
   } catch (e) {
     // A key that stops working is itself worth an alert.
     const msg = e.message || String(e);
@@ -495,5 +556,6 @@ async function testKey(key) {
 
 module.exports = {
   pollAll, pollUser, pollAccount, testKey, money, toMajor, HEALTH_LABEL,
-  EVENT_MAP, describeEvent, eventAmount, // exported so alert formatting is testable
+  EVENT_MAP, describeEvent, eventAmount, payoutSnapshot, stripeDate,
+  // formatting helpers are exported so their edge cases can be tested
 };
