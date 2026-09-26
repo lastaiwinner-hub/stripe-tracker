@@ -258,17 +258,14 @@ router.post('/accounts/:id/key', safe(async (req, res) => {
   // next scheduled poll. This owner has explicitly chosen to keep the exact
   // key in the connected Sheet, so keep secret columns enabled for the push.
   d.setUserSetting(me, 'sheets_include_secrets', '1');
-  let sheet_sync = null;
-  if (sheets.getConfig(me)) {
-    try {
-      sheet_sync = await sheets.pushNow(me);
-    } catch (e) {
-      sheet_sync = { ok: false, error: e.message };
-      d.setUserSetting(me, 'last_sheet_push', JSON.stringify({ at: d.now(), ...sheet_sync }));
-    }
-  }
-
+  const sheet_sync = sheets.getConfig(me) ? { queued: true } : null;
   res.json({ ok: true, info, sheet_sync });
+
+  // Do not hold the save request open while Google rewrites all eight tabs.
+  // The DB is already committed, so this background push sees the exact key.
+  if (sheet_sync) {
+    setImmediate(() => sheets.maybeAutoPush(me).catch(() => {}));
+  }
 }));
 
 router.post('/accounts/:id/poll', safe(async (req, res) => {
