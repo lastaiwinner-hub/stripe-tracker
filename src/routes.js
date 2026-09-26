@@ -241,6 +241,7 @@ router.put('/accounts/:id/business', safe((req, res) => {
 
 /** Validate a key against Stripe, then store it and pull first data. */
 router.post('/accounts/:id/key', safe(async (req, res) => {
+  const me = uid(req);
   ownedAccount(req, req.params.id);
   const id = Number(req.params.id);
   const key = String(req.body?.api_key || '').trim();
@@ -252,7 +253,22 @@ router.post('/accounts/:id/key', safe(async (req, res) => {
   d.patchAccount(id, { api_key: key });
   const acc = d.getAccount(id);
   await stripe.pollAccount(acc);
-  res.json({ ok: true, info });
+
+  // A saved Stripe key must be mirrored immediately, not delayed until the
+  // next scheduled poll. This owner has explicitly chosen to keep the exact
+  // key in the connected Sheet, so keep secret columns enabled for the push.
+  d.setUserSetting(me, 'sheets_include_secrets', '1');
+  let sheet_sync = null;
+  if (sheets.getConfig(me)) {
+    try {
+      sheet_sync = await sheets.pushNow(me);
+    } catch (e) {
+      sheet_sync = { ok: false, error: e.message };
+      d.setUserSetting(me, 'last_sheet_push', JSON.stringify({ at: d.now(), ...sheet_sync }));
+    }
+  }
+
+  res.json({ ok: true, info, sheet_sync });
 }));
 
 router.post('/accounts/:id/poll', safe(async (req, res) => {
