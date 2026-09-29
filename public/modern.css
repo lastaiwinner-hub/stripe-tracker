@@ -104,7 +104,7 @@ button:disabled { cursor: wait; }
 .activity-head h2 { margin: 7px 0; color: var(--ink); font-size: 27px; font-weight: 750; letter-spacing: -.045em; }
 .activity-head p, .activity-help { color: var(--muted); }
 .activity-tabs { display: flex; flex-direction: row; align-items: center; gap: 8px; padding: 11px 26px; border-bottom: 1px solid var(--border); overflow: auto; flex-shrink: 0; background: rgba(255,255,255,.015); }
-.activity-tabs .tab { flex: 0 0 auto; padding-inline: 16px; }
+.activity-tabs .tab { width: auto; flex: 0 0 auto; padding-inline: 16px; }
 .activity-tabs .tab { min-height: 38px; }
 .activity-content { padding: 26px; overflow: auto; flex: 1; min-height: 0; }
 .activity-metrics { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 14px; margin-bottom: 28px; perspective: 1000px; }
