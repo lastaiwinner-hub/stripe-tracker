@@ -15,7 +15,23 @@
 const path = require('path');
 const fs = require('fs');
 const Database = require('better-sqlite3');
+const { createHash } = require('crypto');
 const { encrypt, decrypt } = require('./crypto');
+
+/**
+ * Is this value already an AES-GCM blob from crypto.js, or still plaintext?
+ * Blobs are base64 of iv(12) + tag(16) + ciphertext, so they are at least 28
+ * bytes and decode cleanly. A Telegram token or a JSON key file does neither.
+ */
+function looksEncrypted(v) {
+  const s = String(v || '');
+  if (!s || /[^A-Za-z0-9+/=]/.test(s)) return false;
+  try {
+    return Buffer.from(s, 'base64').length >= 29;
+  } catch {
+    return false;
+  }
+}
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -145,10 +161,31 @@ db.exec(`
     label      TEXT NOT NULL DEFAULT ''
   );
 
+  -- One row per account per day, written by the poller. Without this the app
+  -- could only answer "what happened today": everything reset at midnight, so
+  -- there was no trend, no 30-day total and -- the one that actually keeps
+  -- accounts alive -- no dispute rate.
+  CREATE TABLE IF NOT EXISTS daily_stats (
+    account_id INTEGER NOT NULL REFERENCES stripe_accounts(id) ON DELETE CASCADE,
+    day        TEXT    NOT NULL,          -- YYYY-MM-DD in the account's own timezone
+    currency   TEXT    NOT NULL DEFAULT '',
+    sales      INTEGER NOT NULL DEFAULT 0,
+    volume     REAL    NOT NULL DEFAULT 0,
+    refunds    INTEGER NOT NULL DEFAULT 0,
+    refunded   REAL    NOT NULL DEFAULT 0,
+    declines   INTEGER NOT NULL DEFAULT 0,
+    disputes   INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT    NOT NULL DEFAULT '',
+    PRIMARY KEY (account_id, day)
+  );
+
+  -- Indexes on user_id live in migrate(), because that column is added by
+  -- ALTER TABLE further down and does not exist on a brand-new database yet.
   CREATE INDEX IF NOT EXISTS idx_acc_group   ON stripe_accounts(group_id);
   CREATE INDEX IF NOT EXISTS idx_ev_account  ON events(account_id);
   CREATE INDEX IF NOT EXISTS idx_ev_created  ON events(created_at);
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_ev_ref ON events(stripe_ref) WHERE stripe_ref <> '';
+  CREATE INDEX IF NOT EXISTS idx_ds_day      ON daily_stats(day);
+  CREATE INDEX IF NOT EXISTS idx_sess_user   ON sessions(user_id);
 `);
 
 /**
@@ -185,6 +222,14 @@ db.exec(`
       db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} INTEGER`);
     }
   }
+  // Safe now that every ownerCols ALTER above has run. Every hot query filters
+  // on user_id and nothing covered it.
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_acc_user ON stripe_accounts(user_id);
+    CREATE INDEX IF NOT EXISTS idx_grp_user ON groups(user_id);
+    CREATE INDEX IF NOT EXISTS idx_ev_user  ON events(user_id, id DESC);
+  `);
+
   const firstAdmin = db.prepare("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1").get();
   if (firstAdmin) {
     for (const [table] of ownerCols) {
@@ -229,9 +274,88 @@ db.exec(`
     // Free-drag position inside the group box; null until first moved.
     ['pos_x', 'REAL'],
     ['pos_y', 'REAL'],
+    // The live Stripe key, encrypted. The old plaintext `api_key` column is
+    // emptied by the migration below and kept only so old rows still read.
+    ['enc_api_key', 'TEXT'],
+    // Balances as {currency: amount} JSON. The old scalar columns added USD to
+    // EUR and showed the sum under one currency label.
+    ['balances_available', "TEXT NOT NULL DEFAULT ''"],
+    ['balances_pending', "TEXT NOT NULL DEFAULT ''"],
+    // Consecutive failed polls. An account is only declared unreachable after
+    // FAIL_THRESHOLD of them, so one dropped packet is no longer an incident.
+    ['fail_streak', 'INTEGER NOT NULL DEFAULT 0'],
+    // The account's own timezone, so "today" rolls over when Stripe says it does.
+    ['timezone', "TEXT NOT NULL DEFAULT ''"],
   ];
   for (const [name, decl] of additions) {
     if (!existing.has(name)) db.exec(`ALTER TABLE stripe_accounts ADD COLUMN ${name} ${decl}`);
+  }
+
+  // --- Stripe keys were stored in plaintext -------------------------------
+  // Every other secret in this table (password, 2FA, SSN, bank numbers) went
+  // through crypto.js from the start; the live sk_live_ key -- the single most
+  // valuable thing here -- did not. Move them across once, then blank the
+  // plaintext column so a copy of stripe.db is worthless on its own.
+  {
+    const plain = db.prepare("SELECT id, api_key FROM stripe_accounts WHERE api_key <> '' AND (enc_api_key IS NULL OR enc_api_key = '')").all();
+    if (plain.length) {
+      const move = db.transaction((rows) => {
+        const up = db.prepare("UPDATE stripe_accounts SET enc_api_key = ?, api_key = '' WHERE id = ?");
+        for (const r of rows) up.run(encrypt(r.api_key), r.id);
+      });
+      move(plain);
+      console.log(`[db] encrypted ${plain.length} Stripe API key(s) and cleared the plaintext column`);
+    }
+    // Anything left in api_key after that is a straggler from a concurrent write.
+    db.prepare("UPDATE stripe_accounts SET api_key = '' WHERE api_key <> '' AND enc_api_key IS NOT NULL").run();
+  }
+
+  // --- Telegram tokens and Google service-account keys, same story ---------
+  {
+    const SECRET_KEYS = ['tg_token', 'service_account'];
+    const rows = db.prepare(
+      `SELECT user_id, key, value FROM user_settings WHERE key IN (${SECRET_KEYS.map(() => '?').join(',')}) AND value <> ''`
+    ).all(...SECRET_KEYS);
+    const stillPlain = rows.filter((r) => !looksEncrypted(r.value));
+    if (stillPlain.length) {
+      const move = db.transaction((list) => {
+        const up = db.prepare('UPDATE user_settings SET value = ? WHERE user_id = ? AND key = ?');
+        for (const r of list) up.run(encrypt(r.value), r.user_id, r.key);
+      });
+      move(stillPlain);
+      console.log(`[db] encrypted ${stillPlain.length} bot token / service-account key(s)`);
+    }
+  }
+
+  // --- de-duplication was global, not per user ----------------------------
+  // With one index across every user, two people tracking the same Stripe
+  // account meant the second one silently never heard about anything --
+  // INSERT OR IGNORE swallowed it without a trace.
+  {
+    const idx = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_ev_ref'").get();
+    if (idx) {
+      db.exec('DROP INDEX idx_ev_ref');
+      console.log('[db] replaced the global event de-dup index with a per-user one');
+    }
+    db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_ev_ref_user ON events(user_id, stripe_ref) WHERE stripe_ref <> ''");
+  }
+
+  // --- leftovers from the single-password era -----------------------------
+  {
+    const gone = db.prepare("DELETE FROM settings WHERE key IN ('auth_hash', 'auth_salt')").run();
+    if (gone.changes) console.log('[db] dropped stale single-password credentials from settings');
+  }
+
+  // Session tokens are hashed from now on. A stored raw token and a stored
+  // hash are both 64 hex characters, so they cannot be told apart by shape --
+  // clear the table once, under a flag, and let everyone sign in again.
+  {
+    const done = db.prepare("SELECT value FROM settings WHERE key = 'sessions_hashed'").get();
+    if (!done) {
+      const n = db.prepare('DELETE FROM sessions').run().changes;
+      db.prepare("INSERT INTO settings (key, value) VALUES ('sessions_hashed', '1')").run();
+      if (n) console.log(`[db] cleared ${n} pre-hash session(s) -- everyone signs in once more`);
+    }
   }
 })();
 
@@ -280,6 +404,23 @@ function getUserSetting(userId, key, fallback = null) {
   return row ? row.value : fallback;
 }
 
+/**
+ * Per-user secrets (bot token, Google service-account key) go through the same
+ * AES-GCM path as everything else. Reads tolerate a plaintext value so a row
+ * the migration has not touched yet still works.
+ */
+function getUserSecret(userId, key, fallback = '') {
+  const raw = getUserSetting(userId, key, '');
+  if (!raw) return fallback;
+  if (!looksEncrypted(raw)) return raw;
+  return decrypt(raw) || fallback;
+}
+
+function setUserSecret(userId, key, value) {
+  const v = String(value ?? '');
+  setUserSetting(userId, key, v === '' ? '' : encrypt(v));
+}
+
 function setUserSetting(userId, key, value) {
   withRetry(() =>
     prep(`INSERT INTO user_settings (user_id, key, value) VALUES (?, ?, ?)
@@ -321,6 +462,28 @@ function deleteGroup(id) {
 
 // --- accounts ---------------------------------------------------------------
 
+/**
+ * The account's Stripe key, decrypted. Reads the encrypted column and falls
+ * back to the legacy plaintext one so a row the migration has not reached yet
+ * still polls.
+ */
+function accountKey(a) {
+  if (!a) return '';
+  if (a.enc_api_key) return decrypt(a.enc_api_key);
+  return a.api_key || '';
+}
+
+/** Balances are stored as {currency: amount} JSON — USD and EUR never merge. */
+function parseMoneyMap(raw) {
+  if (!raw) return {};
+  try {
+    const v = JSON.parse(raw);
+    return v && typeof v === 'object' ? v : {};
+  } catch {
+    return {};
+  }
+}
+
 /** Never let the raw API key reach the browser — only a masked hint. */
 function maskKey(key) {
   if (!key) return '';
@@ -336,12 +499,16 @@ function maskKey(key) {
  */
 function publicAccount(a) {
   const {
-    api_key, enc_password, enc_twofa, enc_backup_codes, enc_cred_notes, enc_business, ...rest
+    api_key, enc_api_key, enc_password, enc_twofa, enc_backup_codes,
+    enc_cred_notes, enc_business, ...rest
   } = a;
+  const key = accountKey(a);
   return {
     ...rest,
-    has_key: !!api_key,
-    key_hint: maskKey(api_key),
+    balances_available: parseMoneyMap(a.balances_available),
+    balances_pending: parseMoneyMap(a.balances_pending),
+    has_key: !!key,
+    key_hint: maskKey(key),
     has_password: !!enc_password,
     has_twofa: !!enc_twofa,
     has_backup_codes: !!enc_backup_codes,
@@ -432,10 +599,12 @@ function createAccount(userId, patch) {
     label: '', group_id: null, api_key: '', email: '', notes: '', business_name: '',
     ...normalizeAccount(patch),
   };
+  const enc_api_key = a.api_key ? encrypt(a.api_key) : null;
+  a.api_key = '';
   const info = withRetry(() =>
-    prep(`INSERT INTO stripe_accounts (user_id, label, group_id, api_key, email, notes, business_name, created_at, updated_at)
-          VALUES (@user_id, @label, @group_id, @api_key, @email, @notes, @business_name, @ts, @ts)`)
-      .run({ ...a, user_id: userId, ts: now() })
+    prep(`INSERT INTO stripe_accounts (user_id, label, group_id, api_key, enc_api_key, email, notes, business_name, created_at, updated_at)
+          VALUES (@user_id, @label, @group_id, '', @enc_api_key, @email, @notes, @business_name, @ts, @ts)`)
+      .run({ ...a, enc_api_key, user_id: userId, ts: now() })
   );
   bumpVersion();
   return Number(info.lastInsertRowid);
@@ -443,6 +612,12 @@ function createAccount(userId, patch) {
 
 function patchAccount(id, patch) {
   const clean = normalizeAccount(patch);
+  // A key arriving from the UI is encrypted on the way in and the plaintext
+  // column is explicitly blanked, so no path can reintroduce a cleartext key.
+  if (clean.api_key !== undefined) {
+    clean.enc_api_key = clean.api_key ? encrypt(clean.api_key) : null;
+    clean.api_key = '';
+  }
   const cols = Object.keys(clean);
   if (!cols.length) return 0;
   const sql = `UPDATE stripe_accounts SET ${cols.map((c) => `${c} = @${c}`).join(', ')}, updated_at = @ts WHERE id = @id`;
@@ -511,7 +686,7 @@ function addEvent(ev) {
 
 function listEvents(userId, limit = 200) {
   return withRetry(() =>
-    prep(`SELECT e.*, a.label AS account_label
+    prep(`SELECT e.*, a.label AS account_label, a.stripe_id AS account_stripe_id
           FROM events e LEFT JOIN stripe_accounts a ON a.id = e.account_id
           WHERE e.user_id = ?
           ORDER BY e.created_at DESC, e.id DESC LIMIT ?`).all(userId, limit)
@@ -520,7 +695,7 @@ function listEvents(userId, limit = 200) {
 
 function unnotifiedEvents() {
   return withRetry(() =>
-    prep(`SELECT e.*, a.label AS account_label
+    prep(`SELECT e.*, a.label AS account_label, a.stripe_id AS account_stripe_id
           FROM events e LEFT JOIN stripe_accounts a ON a.id = e.account_id
           WHERE e.notified = 0 ORDER BY e.id`).all()
   );
@@ -569,8 +744,28 @@ function updateUser(id, patch) {
   return withRetry(() => prep(sql).run({ ...patch, id }).changes);
 }
 
+/**
+ * The user_id columns were added by ALTER TABLE, which cannot attach a foreign
+ * key in SQLite, so nothing cascaded: a removed person's accounts, encrypted
+ * credentials and events all survived -- and the poller kept using their live
+ * Stripe keys forever. Do it by hand, in one transaction.
+ */
 function deleteUser(id) {
-  return withRetry(() => prep('DELETE FROM users WHERE id = ?').run(id).changes);
+  return withRetry(() => {
+    const run = db.transaction((userId) => {
+      const accounts = db.prepare('SELECT id FROM stripe_accounts WHERE user_id = ?').all(userId);
+      const dropStats = db.prepare('DELETE FROM daily_stats WHERE account_id = ?');
+      for (const a of accounts) dropStats.run(a.id);
+      db.prepare('DELETE FROM events WHERE user_id = ?').run(userId);
+      db.prepare('DELETE FROM stripe_accounts WHERE user_id = ?').run(userId);
+      db.prepare('DELETE FROM groups WHERE user_id = ?').run(userId);
+      db.prepare('DELETE FROM user_settings WHERE user_id = ?').run(userId);
+      db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
+      for (const a of accounts) db.prepare('DELETE FROM settings WHERE key = ?').run(`cursor_${a.id}`);
+      return db.prepare('DELETE FROM users WHERE id = ?').run(userId).changes;
+    });
+    return run(id);
+  });
 }
 
 function touchLogin(id) {
@@ -584,10 +779,17 @@ function clearUserSessions(userId) {
 
 // --- sessions ---------------------------------------------------------------
 
+/**
+ * Only a SHA-256 of the cookie value is stored. Read access to stripe.db used
+ * to be enough to impersonate every signed-in user; now the rows are useless
+ * without the token the browser holds.
+ */
+const sessionHash = (token) => createHash('sha256').update(String(token)).digest('hex');
+
 function createSession(token, userId, expiresAt, label) {
   withRetry(() =>
     prep('INSERT INTO sessions (token, user_id, created_at, expires_at, label) VALUES (?, ?, ?, ?, ?)')
-      .run(token, userId, now(), expiresAt, label || '')
+      .run(sessionHash(token), userId, now(), expiresAt, label || '')
   );
 }
 
@@ -595,12 +797,12 @@ function getSession(token) {
   return withRetry(() =>
     prep(`SELECT s.*, u.email, u.role, u.active
           FROM sessions s JOIN users u ON u.id = s.user_id
-          WHERE s.token = ?`).get(token)
+          WHERE s.token = ?`).get(sessionHash(token))
   );
 }
 
 function deleteSession(token) {
-  withRetry(() => prep('DELETE FROM sessions WHERE token = ?').run(token));
+  withRetry(() => prep('DELETE FROM sessions WHERE token = ?').run(sessionHash(token)));
 }
 
 /** Drop expired rows, and every row when the password changes. */
@@ -676,8 +878,106 @@ function setBusiness(id, payload) {
   return changes;
 }
 
+// --- daily history ----------------------------------------------------------
+
+/**
+ * Upsert one account-day. The poller recomputes the current day from Stripe on
+ * every pass, so a plain REPLACE of the counters is correct and idempotent --
+ * no double counting when the same charge is seen twice.
+ */
+function recordDay(accountId, day, stats) {
+  const row = {
+    account_id: accountId,
+    day,
+    currency: stats.currency || '',
+    sales: stats.sales || 0,
+    volume: stats.volume || 0,
+    refunds: stats.refunds || 0,
+    refunded: stats.refunded || 0,
+    declines: stats.declines || 0,
+    disputes: stats.disputes || 0,
+    ts: now(),
+  };
+  withRetry(() =>
+    prep(`INSERT INTO daily_stats (account_id, day, currency, sales, volume, refunds, refunded, declines, disputes, updated_at)
+          VALUES (@account_id, @day, @currency, @sales, @volume, @refunds, @refunded, @declines, @disputes, @ts)
+          ON CONFLICT(account_id, day) DO UPDATE SET
+            currency = excluded.currency,
+            sales    = excluded.sales,
+            volume   = excluded.volume,
+            refunds  = excluded.refunds,
+            refunded = excluded.refunded,
+            declines = MAX(daily_stats.declines, excluded.declines),
+            disputes = MAX(daily_stats.disputes, excluded.disputes),
+            updated_at = excluded.updated_at`).run(row)
+  );
+}
+
+/** Bump a counter that is fed by events rather than recomputed from Stripe. */
+function bumpDay(accountId, day, column, by = 1) {
+  if (!['declines', 'disputes', 'refunds'].includes(column)) return;
+  withRetry(() =>
+    prep(`INSERT INTO daily_stats (account_id, day, ${column}, updated_at)
+          VALUES (?, ?, ?, ?)
+          ON CONFLICT(account_id, day) DO UPDATE SET
+            ${column} = daily_stats.${column} + excluded.${column},
+            updated_at = excluded.updated_at`).run(accountId, day, by, now())
+  );
+}
+
+/** Every day-row for one user's accounts over the last N days. */
+function listDailyStats(userId, days = 30) {
+  const from = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+  return withRetry(() =>
+    prep(`SELECT ds.* FROM daily_stats ds
+          JOIN stripe_accounts a ON a.id = ds.account_id
+          WHERE a.user_id = ? AND ds.day >= ?
+          ORDER BY ds.day`).all(userId, from)
+  );
+}
+
+/** One row per day across the whole user: what the overview chart draws. */
+function dailyTotals(userId, days = 30) {
+  const from = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+  return withRetry(() =>
+    prep(`SELECT ds.day,
+                 SUM(ds.sales)    AS sales,
+                 SUM(ds.volume)   AS volume,
+                 SUM(ds.refunds)  AS refunds,
+                 SUM(ds.refunded) AS refunded,
+                 SUM(ds.declines) AS declines,
+                 SUM(ds.disputes) AS disputes
+          FROM daily_stats ds
+          JOIN stripe_accounts a ON a.id = ds.account_id
+          WHERE a.user_id = ? AND ds.day >= ?
+          GROUP BY ds.day ORDER BY ds.day`).all(userId, from)
+  );
+}
+
+// --- maintenance ------------------------------------------------------------
+
+/**
+ * The events table only ever grew, and the write-ahead log had never been
+ * checkpointed -- 4.1 MB of WAL against a 557 KB database. Both are cheap to
+ * keep in hand once something actually asks.
+ */
+function pruneEvents(keepDays = 90) {
+  const cutoff = new Date(Date.now() - keepDays * 86400000).toISOString();
+  const n = withRetry(() => prep('DELETE FROM events WHERE created_at < ? AND notified = 1').run(cutoff).changes);
+  if (n) bumpVersion();
+  return n;
+}
+
+function checkpoint() {
+  try {
+    db.pragma('wal_checkpoint(TRUNCATE)');
+  } catch { /* a busy reader just means we try again next hour */ }
+}
+
 module.exports = {
-  now,
+  now, accountKey, looksEncrypted,
+  recordDay, bumpDay, listDailyStats, dailyTotals, pruneEvents, checkpoint,
+  getUserSecret, setUserSecret,
   getSetting, setSetting, getVersion, bumpVersion,
   getUserSetting, setUserSetting,
   listGroups, getGroup, createGroup, renameGroup, deleteGroup,

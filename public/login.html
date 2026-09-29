@@ -3,16 +3,20 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Stripe Tracker — Sign in</title>
+  <title>Stripe Tracker &mdash; Sign in</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
   <link rel="stylesheet" href="styles.css">
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='80' font-size='80'>💳</text></svg>">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='80' font-size='80'>&#128179;</text></svg>">
 </head>
 <body class="login-body">
   <div class="login-wrap">
     <div class="login-card">
-      <div class="login-brand">💳 <span>Stripe Tracker</span></div>
+      <div class="login-brand"><span class="brand-mark">&#9672;</span>Stripe Tracker</div>
+      <div class="login-tag">Fleet monitoring for Stripe accounts.</div>
 
-      <div id="mode-note" class="login-note"></div>
+      <div id="mode-note" class="login-note" hidden></div>
 
       <form id="form" autocomplete="off">
         <label for="email">Email</label>
@@ -27,7 +31,7 @@
         </div>
 
         <button class="btn" id="go" type="submit">Sign in</button>
-        <div id="msg" class="login-msg"></div>
+        <div id="msg" class="login-msg" role="status" aria-live="polite"></div>
       </form>
     </div>
   </div>

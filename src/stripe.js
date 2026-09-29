@@ -11,28 +11,126 @@
  */
 
 const d = require('./db');
+const { randomUUID } = require('crypto');
+const { requestJSON, pool } = require('./http');
 
 const API = 'https://api.stripe.com/v1';
 
-/** GET a Stripe endpoint with one account's key. */
+/** How many polls in a row must fail before an account is called unreachable. */
+const FAIL_THRESHOLD = 3;
+
+/** Accounts polled at once. Stripe allows 100 read req/s; this is nowhere near. */
+const CONCURRENCY = 6;
+
+/**
+ * GET a Stripe endpoint with one account's key.
+ *
+ * Deadline and retries live in http.js. Before that this was a bare fetch, so
+ * a single dropped packet raised a hard error, flipped the account to
+ * "unreachable" and pushed a critical alert -- 503 times in five weeks.
+ */
 async function sget(key, path, params = {}) {
   const qs = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null) qs.append(k, String(v));
   }
   const url = `${API}${path}${qs.toString() ? '?' + qs : ''}`;
-  const res = await fetch(url, {
+  return requestJSON(url, {
     headers: { Authorization: `Bearer ${key}`, 'Stripe-Version': '2024-06-20' },
+    timeout: 20_000,
+    retries: 2,
+    parseError: (json, res) => json.error?.message || `HTTP ${res.status}`,
   });
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const m = json.error?.message || `HTTP ${res.status}`;
-    const err = new Error(m);
-    err.statusCode = res.status;
-    err.stripeCode = json.error?.code;
-    throw err;
+}
+
+/**
+ * POST to Stripe with one account's key.
+ *
+ * This is the only place the app writes. Two rules make that safe:
+ *
+ *   1. Every call carries an Idempotency-Key. http.js retries on 5xx and
+ *      network failure, and without a key a retried refund is a second refund.
+ *      Stripe replays the original response instead.
+ *   2. Nothing here is ever called by the poller. Every write originates from
+ *      an explicit confirmation in the browser.
+ */
+async function spost(key, path, params = {}, idempotencyKey) {
+  const body = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === null || v === '') continue;
+    body.append(k, String(v));
   }
-  return json;
+  return requestJSON(`${API}${path}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${key}`,
+      'Stripe-Version': '2024-06-20',
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Idempotency-Key': idempotencyKey || randomUUID(),
+    },
+    body: body.toString(),
+    timeout: 25_000,
+    retries: 2,
+    parseError: (json, res) => json.error?.message || `HTTP ${res.status}`,
+  });
+}
+
+/**
+ * DELETE, for the handful of Stripe resources that use it (cancelling a
+ * subscription outright, removing a customer, clearing a Radar list entry).
+ */
+async function sdel(key, path, idempotencyKey) {
+  return requestJSON(`${API}${path}`, {
+    method: 'DELETE',
+    headers: {
+      Authorization: `Bearer ${key}`,
+      'Stripe-Version': '2024-06-20',
+      'Idempotency-Key': idempotencyKey || randomUUID(),
+    },
+    timeout: 25_000,
+    retries: 2,
+    parseError: (json, res) => json.error?.message || `HTTP ${res.status}`,
+  });
+}
+
+/**
+ * The calendar day in a given IANA timezone, as YYYY-MM-DD.
+ *
+ * "Today" used to be this Windows machine's midnight, so a US account tracked
+ * from another timezone rolled its daily counter at the wrong hour.
+ */
+function dayIn(timezone) {
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone || 'UTC', year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(new Date());
+  } catch {
+    return new Date().toISOString().slice(0, 10);
+  }
+}
+
+/** Unix seconds at the start of the current day in that timezone. */
+function dayStartIn(timezone) {
+  const day = dayIn(timezone);
+  // Walk back from now to the first second that still formats as `day`.
+  const now = Math.floor(Date.now() / 1000);
+  let lo = now - 86400 * 2;
+  let hi = now;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    const d = (() => {
+      try {
+        return new Intl.DateTimeFormat('en-CA', {
+          timeZone: timezone || 'UTC', year: 'numeric', month: '2-digit', day: '2-digit',
+        }).format(new Date(mid * 1000));
+      } catch {
+        return new Date(mid * 1000).toISOString().slice(0, 10);
+      }
+    })();
+    if (d < day) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
 }
 
 /** Stripe amounts are in the smallest unit (cents). */
@@ -45,36 +143,6 @@ function toMajor(amount, currency) {
 function money(amount, currency) {
   const v = toMajor(amount, currency);
   return `${v.toLocaleString('en-US', { maximumFractionDigits: 2 })} ${String(currency || '').toUpperCase()}`;
-}
-
-function stripeDate(timestamp) {
-  if (!timestamp) return '';
-  return new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'UTC', day: '2-digit', month: 'short', year: 'numeric',
-  }).format(new Date(timestamp * 1000));
-}
-
-/** Pick the payout that is still on its way, falling back to the latest one. */
-function payoutSnapshot(payouts) {
-  const list = Array.isArray(payouts) ? payouts : [];
-  const active = list
-    .filter((p) => ['pending', 'in_transit'].includes(p.status))
-    .sort((a, b) => (a.arrival_date || Infinity) - (b.arrival_date || Infinity));
-  const p = active[0] || list[0];
-  if (!p) return null;
-  return {
-    id: p.id,
-    amount: toMajor(p.amount, p.currency),
-    amount_raw: p.amount,
-    currency: p.currency || '',
-    status: p.status || 'unknown',
-    arrival_date: p.arrival_date || null,
-    created: p.created || null,
-    method: p.method || 'standard',
-    type: p.type || '',
-    destination: typeof p.destination === 'string' ? p.destination : (p.destination?.id || ''),
-    is_upcoming: active.includes(p),
-  };
 }
 
 /**
@@ -203,24 +271,12 @@ function describeEvent(ev) {
       }
       break;
     case 'payout.failed':
-    case 'payout.canceled':
-      bits.push(`Status: ${o.status || 'unknown'}`);
-      if (o.amount !== undefined) bits.push(`Amount: ${money(o.amount, o.currency)}`);
-      if (o.created) bits.push(`Started: ${stripeDate(o.created)} (UTC)`);
-      if (o.arrival_date) bits.push(`Expected arrival: ${stripeDate(o.arrival_date)} (UTC)`);
-      if (o.method) bits.push(`Method: ${o.method}`);
-      if (o.destination) bits.push(`Destination: ${typeof o.destination === 'string' ? o.destination : o.destination.id}`);
+      bits.push(`Status: ${o.status}`);
       if (o.failure_message) bits.push(o.failure_message);
-      if (o.failure_code) bits.push(`Failure code: ${o.failure_code}`);
       if (o.failure_balance_transaction) bits.push('Funds returned to your Stripe balance.');
       break;
     case 'payout.paid':
-      bits.push(`Status: ${o.status || 'paid'}`);
-      if (o.amount !== undefined) bits.push(`Amount: ${money(o.amount, o.currency)}`);
-      if (o.created) bits.push(`Started: ${stripeDate(o.created)} (UTC)`);
-      if (o.arrival_date) bits.push(`Bank arrival: ${stripeDate(o.arrival_date)} (UTC)`);
-      if (o.method) bits.push(`Method: ${o.method}`);
-      if (o.destination) bits.push(`Destination: ${typeof o.destination === 'string' ? o.destination : o.destination.id}`);
+      if (o.arrival_date) bits.push(`Arrives ${new Date(o.arrival_date * 1000).toDateString()}`);
       break;
     case 'charge.refunded':
       if (o.amount_refunded) bits.push(`Refunded ${money(o.amount_refunded, o.currency)}`);
@@ -275,15 +331,19 @@ async function refundAdvice(key, chargeId) {
 async function pollEvents(acc, key, since, firstRun) {
   const label = acc.label || acc.business_name || `account ${acc.id}`;
   const verbose = d.getUserSetting(acc.user_id, 'verbose_events', '0') === '1';
+  const today = dayIn(acc.timezone);
   let newest = since;
+  let oldestSeen = Infinity;
   let starting_after;
   let pages = 0;
+  let truncated = false;
 
   do {
     const page = await sget(key, '/events', { limit: 100, 'created[gt]': since, starting_after });
     const list = page.data || [];
     for (const ev of list) {
       if (ev.created > newest) newest = ev.created;
+      if (ev.created < oldestSeen) oldestSeen = ev.created;
       if (firstRun) continue; // never replay history on the first check
 
       const o = ev.data?.object || {};
@@ -314,7 +374,12 @@ async function pollEvents(acc, key, since, firstRun) {
         extra = await refundAdvice(key, typeof o.charge === 'string' ? o.charge : o.charge.id);
       }
 
-      d.addEvent({
+      // Feed the daily rollup. These come from the event stream rather than a
+      // counter endpoint, so they are incremented rather than recomputed --
+      // and only when addEvent actually inserted (dedupe returns null).
+      const rollup = { decline: 'declines', dispute: 'disputes' }[map?.kind];
+
+      const inserted = d.addEvent({
         account_id: acc.id,
         kind: map?.kind || 'other',
         severity: map?.severity || 'info',
@@ -325,6 +390,7 @@ async function pollEvents(acc, key, since, firstRun) {
         stripe_ref: ev.id, // unique per event — dedupe is automatic
         created_at: new Date(ev.created * 1000).toISOString(),
       });
+      if (inserted && rollup) d.bumpDay(acc.id, today, rollup, 1);
 
       // A sale Stripe let through but rated risky is worth a separate heads-up.
       if (type === 'charge.succeeded' && ['elevated', 'highest'].includes(o.outcome?.risk_level)) {
@@ -349,8 +415,17 @@ async function pollEvents(acc, key, since, firstRun) {
     }
     starting_after = page.has_more && list.length ? list[list.length - 1].id : null;
     pages++;
-  } while (starting_after && pages < 10); // safety valve on very busy accounts
+    if (starting_after && pages >= 10) truncated = true; // safety valve
+  } while (starting_after && pages < 10);
 
+  // Stripe returns events newest-first, so hitting the page cap means the
+  // OLDER half went unread. Advancing the cursor to `newest` skipped them
+  // permanently; resume from the oldest one we did see instead and let the
+  // unique index absorb the overlap.
+  if (truncated && Number.isFinite(oldestSeen)) {
+    console.warn(`[stripe] ${label}: more than 1,000 events this cycle — resuming from the oldest seen`);
+    return Math.max(since, oldestSeen - 1);
+  }
   return newest;
 }
 
@@ -359,17 +434,22 @@ async function pollEvents(acc, key, since, firstRun) {
  * since the last cursor.
  */
 async function pollAccount(acc) {
-  const key = acc.api_key;
+  const key = d.accountKey(acc);
   if (!key) return { skipped: 'no API key' };
 
   const label = acc.label || acc.business_name || `account ${acc.id}`;
   const cursorKey = `cursor_${acc.id}`;
   // First run: only look at the last hour so we don't alert on all history.
   const firstRun = !d.getSetting(cursorKey);
-  const since = Number(d.getSetting(cursorKey, String(Math.floor(Date.now() / 1000) - 3600)));
-  let newCursor = since;
+  const stored = Number(d.getSetting(cursorKey, String(Math.floor(Date.now() / 1000) - 3600)));
+  // Stripe's `created` is whole seconds and the filter is strictly greater-than,
+  // so anything sharing the newest second used to be skipped. Overlap by a
+  // minute and let the unique index on stripe_ref do the de-duplication it was
+  // built for.
+  const since = firstRun ? stored : Math.max(0, stored - 60);
+  let newCursor = stored;
 
-  const live = { last_checked: d.now(), last_error: '' };
+  const live = { last_checked: d.now(), last_error: '', fail_streak: 0 };
 
   try {
     // ---- identity + health ----
@@ -382,6 +462,7 @@ async function pollAccount(acc) {
     live.country = acct.country || '';
     live.currency = acct.default_currency || '';
     live.business_name = acct.business_profile?.name || acct.settings?.dashboard?.display_name || acc.business_name || '';
+    live.timezone = acct.settings?.dashboard?.timezone || acct.timezone || '';
     live.charges_enabled = acct.charges_enabled ? 1 : 0;
     live.payouts_enabled = acct.payouts_enabled ? 1 : 0;
     live.requirements = prettyRequirements(req);
@@ -436,8 +517,14 @@ async function pollAccount(acc) {
       });
     }
 
-    // Any other change of overall health (documents now required, etc.)
-    if (knownBefore && acc.health !== health) {
+    // Any other change of overall health (documents now required, etc.).
+    //
+    // `error` is our word for "we could not reach Stripe", not a state Stripe
+    // reports. Coming back out of it is not news -- it used to fire a cheerful
+    // "Healthy" alert after every network blip, which is half of the ~1,100
+    // junk alerts in the history.
+    const recovering = acc.health === 'error';
+    if (knownBefore && !recovering && acc.health !== health) {
       const worse = ['suspended', 'restricted', 'docs'].includes(health);
       d.addEvent({
         account_id: acc.id,
@@ -454,36 +541,70 @@ async function pollAccount(acc) {
     }
 
     // ---- balance ----
+    // /balance returns one entry per currency. The old code added them
+    // together and labelled the total with the account's default currency, so
+    // 500 USD + 400 EUR displayed as "900".
     const bal = await sget(key, '/balance');
-    const sum = (arr) => (arr || []).reduce((s, b) => s + toMajor(b.amount, b.currency), 0);
-    live.balance_available = sum(bal.available);
-    live.balance_pending = sum(bal.pending);
-
-    // Some restricted keys cannot list payouts. Keep the account healthy and
-    // report that limitation in the summary instead of failing the whole poll.
-    let payout = null;
-    let payout_error = '';
-    if (health === 'healthy' && acct.payouts_enabled) {
-      try {
-        const payouts = await sget(key, '/payouts', { limit: 10 });
-        payout = payoutSnapshot(payouts.data);
-      } catch (e) {
-        payout_error = e.message || String(e);
+    const byCurrency = (arr) => {
+      const out = {};
+      for (const b of arr || []) {
+        const c = String(b.currency || '').toLowerCase();
+        out[c] = (out[c] || 0) + toMajor(b.amount, b.currency);
       }
-    }
+      return out;
+    };
+    const avail = byCurrency(bal.available);
+    const pend = byCurrency(bal.pending);
+    live.balances_available = JSON.stringify(avail);
+    live.balances_pending = JSON.stringify(pend);
+    // The scalar columns stay, holding only the account's own default currency,
+    // so nothing sums figures that were never comparable.
+    const home = String(acct.default_currency || '').toLowerCase();
+    live.balance_available = avail[home] || 0;
+    live.balance_pending = pend[home] || 0;
 
     // ---- today's counters (no alerts — those come from /events) ----
-    const dayStart = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
-    const charges = await sget(key, '/charges', { limit: 100, 'created[gte]': dayStart });
+    // Paginated: `limit: 100` with no follow-through meant a busy account's
+    // counter simply stopped climbing at 100. Day boundary comes from the
+    // account's own timezone, not this machine's.
+    const tz = live.timezone;
+    const today = dayIn(tz);
+    const dayStart = dayStartIn(tz);
+
     let salesToday = 0;
     let volumeToday = 0;
-    for (const ch of charges.data || []) {
-      if (ch.status !== 'succeeded' || ch.refunded) continue;
-      salesToday++;
-      volumeToday += toMajor(ch.amount, ch.currency);
-    }
+    let refundCount = 0;
+    let refundedToday = 0;
+    let after;
+    let chargePages = 0;
+    do {
+      const page = await sget(key, '/charges', { limit: 100, 'created[gte]': dayStart, starting_after: after });
+      const rows = page.data || [];
+      for (const ch of rows) {
+        if (ch.amount_refunded > 0) {
+          refundCount++;
+          refundedToday += toMajor(ch.amount_refunded, ch.currency);
+        }
+        if (ch.status !== 'succeeded' || ch.refunded) continue;
+        salesToday++;
+        volumeToday += toMajor(ch.amount, ch.currency);
+      }
+      after = page.has_more && rows.length ? rows[rows.length - 1].id : null;
+      chargePages++;
+    } while (after && chargePages < 20); // 2,000 charges in a day is plenty
+
     live.sales_today = salesToday;
     live.volume_today = volumeToday;
+
+    // History. Everything used to reset at midnight and vanish; this is what
+    // makes trends, 30-day totals and a dispute rate possible at all.
+    d.recordDay(acc.id, today, {
+      currency: live.currency,
+      sales: salesToday,
+      volume: volumeToday,
+      refunds: refundCount,
+      refunded: refundedToday,
+    });
 
     // ---- everything Stripe recorded: sales, declines, blocks, reviews,
     //      fraud warnings, disputes, refunds, payouts ----
@@ -491,53 +612,75 @@ async function pollAccount(acc) {
 
     d.setSetting(cursorKey, String(Math.max(newCursor, since)));
     d.updateLive(acc.id, live);
-    return {
-      ok: true,
-      health,
-      payouts_enabled: !!acct.payouts_enabled,
-      payout,
-      payout_error,
-    };
+    return { ok: true, health };
   } catch (e) {
-    // A key that stops working is itself worth an alert.
     const msg = e.message || String(e);
-    live.health = 'error';
-    live.last_error = msg;
-    d.updateLive(acc.id, live);
-    if (acc.health !== 'error') {
-      d.addEvent({
-        account_id: acc.id,
-        kind: 'error',
-        severity: 'critical',
-        title: `🔌 Cannot reach ${label}`,
-        detail: msg,
-        stripe_ref: `err_${acc.id}_${Date.now()}`,
-      });
+    const streak = (acc.fail_streak || 0) + 1;
+
+    // A key Stripe actively rejects is real and permanent -- say so at once.
+    // Everything else has to fail FAIL_THRESHOLD times in a row before we are
+    // willing to call it an incident. 503 of the 524 connection alerts ever
+    // recorded here said "fetch failed" and were gone by the next poll.
+    const permanent = e.status !== undefined && e.status >= 400 && e.status < 500 && e.status !== 429;
+    const confirmed = permanent || streak >= FAIL_THRESHOLD;
+
+    live.fail_streak = streak;
+    live.last_error = confirmed ? msg : `${msg} (attempt ${streak}/${FAIL_THRESHOLD})`;
+
+    if (confirmed) {
+      live.health = 'error';
+      d.updateLive(acc.id, live);
+      if (acc.health !== 'error') {
+        d.addEvent({
+          account_id: acc.id,
+          kind: 'error',
+          severity: 'critical',
+          title: `🔌 Cannot reach ${label}`,
+          detail: permanent
+            ? msg
+            : `${msg}
+
+Failed ${streak} checks in a row. Earlier one-off blips are not reported.`,
+          stripe_ref: `err_${acc.id}_${Date.now()}`,
+        });
+      }
+    } else {
+      // Keep the previous health showing. A transient miss is not a state change.
+      delete live.health;
+      d.updateLive(acc.id, live);
+      console.warn(`[stripe] ${label}: ${msg} (${streak}/${FAIL_THRESHOLD}, not alerting yet)`);
     }
-    return { ok: false, error: msg };
+    return { ok: false, error: msg, streak, alerted: confirmed };
   }
+}
+
+/**
+ * Poll a list of accounts with a bounded number in flight.
+ *
+ * These ran strictly one at a time: 41 accounts x 4+ calls is 164 serial
+ * round-trips inside a 60-second budget, so the cycle regularly overran its
+ * own interval and alert latency was worse than the number in Settings said.
+ */
+async function pollMany(accounts) {
+  const started = Date.now();
+  const results = await pool(accounts, CONCURRENCY, async (acc) => ({
+    id: acc.id,
+    label: acc.label,
+    ...(await pollAccount(acc).catch((e) => ({ ok: false, error: e.message }))),
+  }));
+  d.setSetting('last_poll', d.now());
+  d.setSetting('last_poll_ms', String(Date.now() - started));
+  return results;
 }
 
 /** Poll every account of every user — the background loop. */
 async function pollAll() {
-  const accounts = d.listAllAccounts().filter((a) => a.api_key);
-  const results = [];
-  for (const acc of accounts) {
-    results.push({ id: acc.id, label: acc.label, ...(await pollAccount(acc)) });
-  }
-  d.setSetting('last_poll', d.now());
-  return results;
+  return pollMany(d.listAllAccounts().filter((a) => d.accountKey(a)));
 }
 
 /** Poll just one user's accounts — what "Check all now" calls. */
 async function pollUser(userId) {
-  const accounts = d.listAccounts(userId).filter((a) => a.api_key);
-  const results = [];
-  for (const acc of accounts) {
-    results.push({ id: acc.id, label: acc.label, ...(await pollAccount(acc)) });
-  }
-  d.setSetting('last_poll', d.now());
-  return results;
+  return pollMany(d.listAccounts(userId).filter((a) => d.accountKey(a)));
 }
 
 /** Validate a key before saving it, and report who it belongs to. */
@@ -555,7 +698,7 @@ async function testKey(key) {
 }
 
 module.exports = {
-  pollAll, pollUser, pollAccount, testKey, money, toMajor, HEALTH_LABEL,
-  EVENT_MAP, describeEvent, eventAmount, payoutSnapshot, stripeDate,
-  // formatting helpers are exported so their edge cases can be tested
+  pollAll, pollUser, pollAccount, testKey, dayIn, FAIL_THRESHOLD,
+  sget, spost, sdel, deriveHealth, money, toMajor, HEALTH_LABEL,
+  EVENT_MAP, describeEvent, eventAmount, // exported so alert formatting is testable
 };

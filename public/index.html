@@ -4,28 +4,54 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Stripe Tracker</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
   <link rel="stylesheet" href="styles.css">
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='80' font-size='80'>💳</text></svg>">
+  <link rel="stylesheet" href="modern.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%23635BFF'/><text x='50' y='73' font-size='62' font-family='sans-serif' font-weight='700' fill='white' text-anchor='middle'>S</text></svg>">
 </head>
 <body>
-  <header>
-    <div class="brand">💳 <span>Stripe Tracker</span></div>
-    <nav>
-      <button class="tab" data-tab="structure">Accounts</button>
-      <button class="tab" data-tab="alerts">Alerts</button>
-      <button class="tab" data-tab="settings">Settings</button>
+
+  <aside class="rail">
+    <div class="brand"><span class="brand-mark">S</span><span>Stripe Tracker</span></div>
+
+    <nav aria-label="Sections">
+      <button class="tab active" data-tab="pulse"><span class="ti" aria-hidden="true">&#9673;</span>Pulse</button>
+      <button class="tab" data-tab="accounts"><span class="ti" aria-hidden="true">&#9638;</span>Accounts</button>
+      <button class="tab" data-tab="act"><span class="ti" aria-hidden="true">&#9889;</span>Act<span class="badge" id="act-badge" style="display:none">0</span></button>
+      <button class="tab" data-tab="alerts"><span class="ti" aria-hidden="true">&#9873;</span>Alerts<span class="badge" id="alerts-badge" style="display:none">0</span></button>
+      <button class="tab" data-tab="settings"><span class="ti" aria-hidden="true">&#9881;</span>Settings</button>
     </nav>
-    <div class="head-right">
-      <div id="poll-chip" class="chip">⏳ idle</div>
-      <div id="tg-chip" class="chip">⚪ telegram: off</div>
-      <div id="sheet-chip" class="chip">⚪ sheet: off</div>
-      <button id="logout" class="chip" title="Sign out">⎋ sign out</button>
+
+    <div class="rail-foot">
+      <div class="rail-status">
+        <span class="chip" id="poll-chip"><span class="dot"></span>starting&#8230;</span>
+        <span class="chip" id="tg-chip"><span class="dot"></span>telegram</span>
+        <span class="chip" id="sheet-chip"><span class="dot"></span>sheet</span>
+      </div>
+      <button id="logout" class="btn secondary sm">Sign out</button>
     </div>
-  </header>
+  </aside>
 
-  <main id="view"></main>
+  <div class="main">
+    <header>
+      <div class="page-title" id="page-title">Pulse</div>
+      <div class="spacer"></div>
+      <button class="cmd-open" id="cmd-open" title="Search accounts and run actions">
+        <span aria-hidden="true">&#8981;</span><span>Search&#8230;</span><kbd>Ctrl K</kbd>
+      </button>
+    </header>
 
-  <div id="toast"></div>
+    <main id="view"></main>
+  </div>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+
+  <script src="ui.js"></script>
+  <script src="orbit.js"></script>
   <script src="app.js"></script>
+  <script src="activity.js"></script>
+  <script src="motion.js"></script>
 </body>
 </html>

@@ -98,7 +98,18 @@ function clientIp(req) {
  * the Stripe keys.
  */
 function isLocalRequest(req) {
-  if (req.headers['cf-connecting-ip'] || req.headers['cf-ray']) return false; // came via Cloudflare
+  // An explicit opt-in, for the case where the owner genuinely has to be
+  // created through a tunnel and knows what that means.
+  if (process.env.ALLOW_REMOTE_SETUP === '1') return true;
+
+  // Any tunnel or reverse proxy announces itself. Checking only for Cloudflare
+  // was too narrow: ngrok, a port-forward or an SSH tunnel all terminate on
+  // this machine, so the socket address alone reads as 127.0.0.1 and a stranger
+  // who found the URL first could have claimed ownership on a fresh install.
+  const proxied = ['cf-connecting-ip', 'cf-ray', 'x-forwarded-for', 'x-forwarded-host',
+    'x-real-ip', 'forwarded', 'ngrok-skip-browser-warning'];
+  if (proxied.some((h) => req.headers[h])) return false;
+
   const raw = (req.socket && req.socket.remoteAddress) || '';
   const ip = raw.replace(/^::ffff:/, '');
   return ip === '127.0.0.1'
@@ -106,6 +117,42 @@ function isLocalRequest(req) {
     || /^10\./.test(ip)
     || /^192\.168\./.test(ip)
     || /^172\.(1[6-9]|2\d|3[01])\./.test(ip);
+}
+
+/**
+ * Response headers for something that holds live payment keys and is reachable
+ * from the internet. The app is entirely self-hosted — no CDN, no external
+ * script, no embedded frame — so the policy can be as tight as it looks.
+ */
+function securityHeaders(req, res, next) {
+  res.setHeader('Content-Security-Policy', [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com",
+    "img-src 'self' data:",
+    "connect-src 'self'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+    "base-uri 'none'",
+    "object-src 'none'",
+  ].join('; '));
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=(), payment=()');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  // Nothing here may be cached, by anyone.
+  //
+  // API responses carry balances and credentials. The static files matter just
+  // as much for a different reason: this app is reached through a Cloudflare
+  // tunnel, and Cloudflare caches .js/.css at the edge by default. Express's
+  // `public, max-age=0` was enough for it to hold a stale app.js and keep
+  // serving it to the browser however hard anyone refreshed.
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  next();
 }
 
 function throttleState(req) {
@@ -154,7 +201,7 @@ function startSession(res, req, userId, label) {
     `${COOKIE}=${token}`,
     'HttpOnly',
     'Path=/',
-    'SameSite=Lax',
+    'SameSite=Strict',
     `Max-Age=${Math.floor(SESSION_MS / 1000)}`,
   ];
   if (isSecure(req)) bits.push('Secure');
@@ -165,7 +212,7 @@ function startSession(res, req, userId, label) {
 function endSession(req, res) {
   const token = parseCookies(req.headers.cookie)[COOKIE];
   if (token) d.deleteSession(token);
-  res.setHeader('Set-Cookie', `${COOKIE}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax`);
+  res.setHeader('Set-Cookie', `${COOKIE}=; HttpOnly; Path=/; Max-Age=0; SameSite=Strict`);
 }
 
 function sessionFrom(req) {
@@ -213,7 +260,7 @@ function gate(req, res, next) {
 module.exports = {
   COOKIE,
   isConfigured, addUser, setUserPassword, verifyLogin,
-  normalizeEmail, checkPasswordRules, isLocalRequest,
+  normalizeEmail, checkPasswordRules, isLocalRequest, securityHeaders,
   startSession, endSession, isLoggedIn, sessionFrom, currentUser, requireAdmin,
   throttleState, noteFailure, clearFailures, clientIp,
   gate,

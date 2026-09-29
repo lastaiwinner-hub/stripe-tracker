@@ -13,6 +13,7 @@
 
 const { createSign } = require('crypto');
 const d = require('./db');
+const { requestJSON } = require('./http');
 
 const BASE = 'https://sheets.googleapis.com/v4/spreadsheets';
 
@@ -21,7 +22,7 @@ const BASE = 'https://sheets.googleapis.com/v4/spreadsheets';
 /** Each user connects their own spreadsheet and their own service account. */
 function getConfig(userId) {
   const sheetId = d.getUserSetting(userId, 'sheet_id');
-  const saRaw = d.getUserSetting(userId, 'service_account');
+  const saRaw = d.getUserSecret(userId, 'service_account', '');
   if (!sheetId || !saRaw) return null;
   try {
     const sa = JSON.parse(saRaw);
@@ -32,7 +33,13 @@ function getConfig(userId) {
   }
 }
 
-const includeSecrets = (userId) => d.getUserSetting(userId, 'sheets_include_secrets', '1') === '1';
+/**
+ * Defaults to OFF. It used to default to on, so connecting a spreadsheet quietly
+ * pushed API keys, passwords, 2FA secrets, SSNs, tax IDs and bank numbers to
+ * Google in plaintext every 60 seconds unless you went looking for the tick box.
+ * Opting in to that is a decision, not a default.
+ */
+const includeSecrets = (userId) => d.getUserSetting(userId, 'sheets_include_secrets', '0') === '1';
 
 // --- auth -------------------------------------------------------------------
 
@@ -58,26 +65,27 @@ async function getToken(sa, userId) {
   const input = `${header}.${claims}`;
   const jwt = `${input}.${b64url(createSign('RSA-SHA256').update(input).sign(sa.private_key))}`;
 
-  const res = await fetch('https://oauth2.googleapis.com/token', {
+  const body = await requestJSON('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: `grant_type=${encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer')}&assertion=${jwt}`,
+    timeout: 20_000,
+    retries: 2,
+    parseError: (j) => `Google auth failed: ${j.error_description || j.error || 'unknown'}`,
   });
-  const body = await res.json();
-  if (!res.ok) throw new Error(`Google auth failed: ${body.error_description || body.error || res.status}`);
   tokenCache.set(userId, { token: body.access_token, exp: Date.now() + body.expires_in * 1000 });
   return body.access_token;
 }
 
 async function gapi(token, method, url, body) {
-  const res = await fetch(url, {
+  return requestJSON(url, {
     method,
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
+    timeout: 30_000,
+    retries: 2,
+    parseError: (json, res) => `Sheets API: ${json.error?.message || `HTTP ${res.status}`}`,
   });
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`Sheets API: ${json.error?.message || `HTTP ${res.status}`}`);
-  return json;
 }
 
 // --- tab helpers ------------------------------------------------------------
@@ -353,7 +361,18 @@ async function run(cfg, userId) {
   for (const name of names) {
     await writeTab(token, cfg.sheetId, name, tabs[name]);
   }
-  await formatTabs(token, cfg.sheetId, tabIds, tabs);
+
+  // Re-running the header band, freeze panes and auto-resize on every push was
+  // a third of the API budget for something that almost never changes. Do it on
+  // the first push, when the column set changes, and once a day after that.
+  const shape = names.map((n) => `${n}:${tabs[n][0]?.length || 0}`).join('|');
+  const lastShape = d.getUserSetting(userId, 'sheet_shape', '');
+  const lastFormat = Number(d.getUserSetting(userId, 'sheet_formatted_at', '0'));
+  if (shape !== lastShape || Date.now() - lastFormat > 86400_000) {
+    await formatTabs(token, cfg.sheetId, tabIds, tabs);
+    d.setUserSetting(userId, 'sheet_shape', shape);
+    d.setUserSetting(userId, 'sheet_formatted_at', String(Date.now()));
+  }
 
   const stamp = {
     at: d.now(),
@@ -366,14 +385,40 @@ async function run(cfg, userId) {
   return stamp;
 }
 
-/** Called after each poll; silent when unconfigured or switched off. */
+/** Never rewrite the whole spreadsheet more often than this. */
+const MIN_AUTO_PUSH_MS = 5 * 60 * 1000;
+
+/**
+ * Called after each poll; silent when unconfigured or switched off.
+ *
+ * This used to fire on every cycle for every user: 8 tabs cleared and rewritten
+ * plus a metadata read and a formatting batch, roughly 20 API calls per user per
+ * minute whether or not a single byte had changed. Google's quota is 60 writes
+ * per minute per user, which is why the logs carry "The operation was aborted"
+ * and "Internal error encountered".
+ *
+ * Two gates now: the tracker's own `data_version` counter must have moved, and
+ * at least five minutes must have passed.
+ */
 async function maybeAutoPush(userId) {
   if (pushing.has(userId)) return;
   if (d.getUserSetting(userId, 'sheets_auto', '1') !== '1') return;
   if (!getConfig(userId)) return;
+
+  const version = d.getVersion();
+  const lastVersion = Number(d.getUserSetting(userId, 'sheet_version', '-1'));
+  const lastAt = Number(d.getUserSetting(userId, 'sheet_pushed_at', '0'));
+
+  if (version === lastVersion) return;                       // nothing changed
+  if (Date.now() - lastAt < MIN_AUTO_PUSH_MS) return;        // too soon
+
   try {
     await pushNow(userId);
+    d.setUserSetting(userId, 'sheet_version', String(version));
+    d.setUserSetting(userId, 'sheet_pushed_at', String(Date.now()));
   } catch (e) {
+    // Back off on failure too, so a broken sheet doesn't retry every minute.
+    d.setUserSetting(userId, 'sheet_pushed_at', String(Date.now()));
     d.setUserSetting(userId, 'last_sheet_push', JSON.stringify({ at: d.now(), ok: false, error: e.message }));
     throw e;
   }
