@@ -379,6 +379,28 @@ function renderPulse(root) {
   });
 }
 
+const homepagePayouts = new Map();
+async function paintHomepagePayouts(root, accounts) {
+  const queue = [...accounts];
+  await Promise.all(Array.from({ length: Math.min(3, queue.length) }, async () => {
+    while (queue.length) {
+      const account = queue.shift();
+      let result = homepagePayouts.get(account.id);
+      if (!result || Date.now() - result.at > 60000) {
+        try { result = { ...(await api('GET', `/accounts/${account.id}/next-payout`)), at: Date.now() }; }
+        catch { result = { error: true, at: Date.now() }; }
+        homepagePayouts.set(account.id, result);
+      }
+      const target = root.querySelector(`[data-home-payout="${account.id}"]`);
+      if (!target) continue;
+      const payout = result.payout;
+      target.innerHTML = result.error ? '<strong>Date unavailable</strong><small>Open activity to check account access</small>' : payout
+        ? `<strong>${esc(new Date(payout.arrival_date * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' }))}</strong><small>${payout.status === 'in_transit' ? 'In transit' : 'Pending'} · Estimated bank arrival</small>`
+        : '<strong>Not scheduled yet</strong><small>No pending or in-transit payout</small>';
+    }
+  }));
+}
+
 function renderAnalytics(root) {
   const accounts = state.accounts;
   const DAY = 86400000;
@@ -406,6 +428,10 @@ function renderAnalytics(root) {
     const disputes = sum(list, 'disputes');
     return { sales, volume, disputes, refunded: sum(list, 'refunded'), refunds: sum(list, 'refunds'), declines: sum(list, 'declines'), average: sales ? volume / sales : 0, disputeRate: sales ? disputes / sales * 100 : null };
   };
+  const sellers = accounts.filter(account => account.health === 'healthy').map(account => {
+    const history = current.filter(row => Number(row.account_id) === Number(account.id));
+    return { ...account, successfulSales: sum(history, 'sales'), salesVolume: sum(history, 'volume') };
+  }).filter(account => account.successfulSales > 0).sort((a, b) => b.salesVolume - a.salesVolume);
   const now = summarize(current);
   const before = summarize(previous);
   const compare = (value, old, inverse = false) => {
@@ -463,9 +489,10 @@ function renderAnalytics(root) {
     <div class="grid-2 analytics-grid"><div>
       <div class="card analytics-chart-card"><div class="card-head"><div><span class="eyebrow">${esc(currency.toUpperCase())} · DAILY</span><h3>Gross sales over ${esc(rangeLabel.toLowerCase())}</h3></div><div class="spacer"></div><span class="analytics-total">${esc(money(now.volume, currency))}</span></div><div class="chart-wrap"><canvas id="main-chart" aria-label="Gross volume and successful charges over ${esc(rangeLabel.toLowerCase())}"></canvas><div class="chart-tip" id="chart-tip"></div></div><div class="chart-legend"><span><i style="background:var(--accent2)"></i>Gross volume</span><span><i style="background:var(--good)"></i>Successful charges (scaled)</span></div></div>
       <div class="card"><div class="card-head"><h3>Fleet health</h3></div><div class="card-sub">${accounts.length} accounts. Select a segment to filter Accounts.</div><div class="fleet">${HEALTH_ORDER.filter((health) => counts[health]).map((health) => `<button class="fleet-seg" data-h="${health}" style="flex:${counts[health]}" title="${counts[health]} ${esc(HEALTH[health])}">${counts[health] > 1 ? counts[health] : ''}</button>`).join('')}</div><div class="fleet-key">${HEALTH_ORDER.filter((health) => counts[health]).map((health) => `<button data-key="${health}"><i class="fleet-seg" data-h="${health}"></i>${esc(HEALTH[health])} · ${counts[health]}</button>`).join('')}</div></div>
-    </div><div class="card"><div class="card-head"><h3>What needs you</h3></div><div class="card-sub">Highest-impact account issues first.</div>${needs.length ? `<div class="attn">${needs.slice(0,14).map((account) => `<button class="attn-row" data-open="${account.id}"><span class="hb hb-${esc(account.health)}">${esc(HEALTH[account.health] || account.health)}</span><span><span class="attn-name">${esc(account.label || 'unnamed')}</span><span class="attn-why">${esc(account.requirements || account.disabled_reason || account.last_error || groupName(account.group_id))}</span></span><span class="attn-right">${esc(ago(account.last_checked))}</span></button>`).join('')}${needs.length > 14 ? `<div class="side-note" style="padding:10px 12px">…and ${needs.length - 14} more</div>` : ''}</div>` : '<div class="empty" style="padding:34px"><b>All clear</b>Nothing is restricted, missing documents or unreachable.</div>'}</div></div>
+    </div><section class="card healthy-sellers"><div class="card-head"><h3>Healthy accounts with sales</h3><span class="seller-count">${sellers.length}</span></div><div class="card-sub">Successful ${esc(currency.toUpperCase())} sales · ${esc(rangeLabel.toLowerCase())}</div>${sellers.length ? `<div class="seller-list">${sellers.map(account => `<article class="seller-row"><div class="seller-heading"><strong>${esc(account.label || 'Unnamed account')}</strong><span class="hb hb-healthy">Healthy</span></div><div class="seller-sales"><span>${account.successfulSales.toLocaleString()} successful sales</span><strong>${esc(money(account.salesVolume, currency))}</strong></div><div class="seller-payout"><span>Upcoming payout</span><div data-home-payout="${account.id}" aria-live="polite"><strong>Checking payout…</strong></div></div><button class="mini activity-launch" data-activity="${account.id}">View sales & payouts</button></article>`).join('')}</div>` : '<div class="empty"><b>No matching accounts</b>Healthy accounts with successful sales in this period and currency will appear here.</div>'}</section></div>
   </div>`;
 
+  paintHomepagePayouts(root, sellers);
   const tip = $('#chart-tip');
   const chart = $('#main-chart');
   if (chart) areaChart(chart, chartRows, { valueKey: 'volume', lineKey: 'sales', tip, height: 230, color: css('--accent2'), lineColor: css('--good'), format: (value) => money(value, currency) });

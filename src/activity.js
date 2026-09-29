@@ -40,4 +40,25 @@ async function activity(account, key, after) {
   cache.set(cacheId, { time: Date.now(), value: clean });
   return clean;
 }
-module.exports = { activity };
+async function nextPayout(account, key) {
+  const cacheId = `payout:${account.id}`;
+  const existing = cache.get(cacheId);
+  if (existing && Date.now() - existing.time < 60000) return existing.value;
+  // Read recent payouts and older pending payouts; Stripe's list filter does
+  // not document in_transit as an accepted status parameter.
+  const lists = await Promise.all([
+    request(key, '/payouts', { limit: 100 }),
+    request(key, '/payouts', { limit: 100, status: 'pending' }),
+  ]);
+  const payouts = lists.flatMap(list => list.data || [])
+    .filter(payout => ['pending', 'in_transit'].includes(payout.status))
+    .sort((a, b) => a.arrival_date - b.arrival_date);
+  const first = payouts[0];
+  const value = { payout: first ? { id: first.id, arrival_date: first.arrival_date,
+    amount: first.amount, currency: first.currency, status: first.status } : null,
+    checked_at: new Date().toISOString() };
+  if (cache.size > 250) cache.clear();
+  cache.set(cacheId, { time: Date.now(), value });
+  return value;
+}
+module.exports = { activity, nextPayout };

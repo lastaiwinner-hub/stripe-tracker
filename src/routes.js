@@ -10,7 +10,7 @@ const actions = require('./actions');
 const auth = require('./auth');
 
 const router = express.Router();
-const { activity } = require('./activity');
+const { activity, nextPayout } = require('./activity');
 
 /**
  * Every failure used to come back as 400, including "not found" and "not
@@ -256,6 +256,14 @@ router.post('/positions', safe((req, res) => {
     d.setPosition(Number(p.id), clear ? null : Number(p.x), clear ? null : Number(p.y));
   }
   res.json({ ok: true });
+}));
+
+router.get('/accounts/:id/next-payout', safe(async (req, res) => {
+  const account = ownedAccount(req, req.params.id);
+  const key = typeof d.accountKey === 'function' ? d.accountKey(account) : account.api_key;
+  if (!key) throw new Error('Add a Stripe API key for this account first.');
+  res.set('Cache-Control', 'no-store');
+  res.json(await nextPayout(account, key));
 }));
 
 router.get('/accounts/:id/activity', safe(async (req, res) => {
