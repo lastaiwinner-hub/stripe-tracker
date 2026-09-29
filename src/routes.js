@@ -199,9 +199,10 @@ router.get('/state', (req, res) => {
 /** Daily history: what every trend line, sparkline and total is drawn from. */
 router.get('/stats', safe((req, res) => {
   const me = uid(req);
-  const days = Math.max(1, Math.min(365, Number(req.query.days) || 30));
+  const allTime = String(req.query.days || '').toLowerCase() === 'all';
+  const days = allTime ? null : Math.max(1, Math.min(730, Number(req.query.days) || 30));
   res.json({
-    days,
+    days: allTime ? 'all' : days,
     totals: d.dailyTotals(me, days),
     per_account: d.listDailyStats(me, days),
   });

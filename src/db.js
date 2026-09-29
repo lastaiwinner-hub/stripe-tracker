@@ -927,6 +927,14 @@ function bumpDay(accountId, day, column, by = 1) {
 
 /** Every day-row for one user's accounts over the last N days. */
 function listDailyStats(userId, days = 30) {
+  if (days === null) {
+    return withRetry(() =>
+      prep(`SELECT ds.* FROM daily_stats ds
+            JOIN stripe_accounts a ON a.id = ds.account_id
+            WHERE a.user_id = ?
+            ORDER BY ds.day`).all(userId)
+    );
+  }
   const from = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
   return withRetry(() =>
     prep(`SELECT ds.* FROM daily_stats ds
@@ -938,6 +946,21 @@ function listDailyStats(userId, days = 30) {
 
 /** One row per day across the whole user: what the overview chart draws. */
 function dailyTotals(userId, days = 30) {
+  if (days === null) {
+    return withRetry(() =>
+      prep(`SELECT ds.day,
+                   SUM(ds.sales)    AS sales,
+                   SUM(ds.volume)   AS volume,
+                   SUM(ds.refunds)  AS refunds,
+                   SUM(ds.refunded) AS refunded,
+                   SUM(ds.declines) AS declines,
+                   SUM(ds.disputes) AS disputes
+            FROM daily_stats ds
+            JOIN stripe_accounts a ON a.id = ds.account_id
+            WHERE a.user_id = ?
+            GROUP BY ds.day ORDER BY ds.day`).all(userId)
+    );
+  }
   const from = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
   return withRetry(() =>
     prep(`SELECT ds.day,

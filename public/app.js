@@ -28,6 +28,8 @@ const state = {
   acctView: readPref('acctView', 'table'),
   acctSort: { key: 'label', dir: 1 },
   acctFilter: '', healthFilter: null,
+  analyticsRange: readPref('analyticsRange', '30'),
+  analyticsCurrency: readPref('analyticsCurrency', 'usd'),
   alertFilter: { sev: null, kind: null, account: null, q: '' },
   consoleAccount: null, consoleQuery: '', consoleResults: null, consoleBusy: false,
   blockLists: null,
@@ -86,7 +88,8 @@ async function loadState() {
 }
 
 async function loadStats() {
-  state.stats = await api('GET', '/stats?days=30');
+  const range = state.analyticsRange === 'all' ? 'all' : Math.min(730, Number(state.analyticsRange || 30) * 2);
+  state.stats = await api('GET', `/stats?days=${range}`);
 }
 
 async function loadTg() { state.tg = await api('GET', '/telegram'); paintChips(); }
@@ -212,7 +215,7 @@ function render() {
   const title = $('#page-title');
   if (title) title.textContent = PAGE_TITLE[state.tab] || 'Stripe Tracker';
   const view = $('#view');
-  if (state.tab === 'pulse') renderPulse(view);
+  if (state.tab === 'pulse') renderAnalytics(view);
   else if (state.tab === 'accounts') renderAccounts(view);
   else if (state.tab === 'act') renderAct(view);
   else if (state.tab === 'alerts') renderAlerts(view);
@@ -374,6 +377,113 @@ function renderPulse(root) {
   $$('[data-open]').forEach((b) => {
     b.onclick = () => openCredentials(Number(b.dataset.open), 'login');
   });
+}
+
+function renderAnalytics(root) {
+  const accounts = state.accounts;
+  const DAY = 86400000;
+  const rangeDays = state.analyticsRange === 'all' ? null : Number(state.analyticsRange || 30);
+  const rangeLabel = rangeDays ? `Last ${rangeDays} days` : 'All time';
+  const rows = state.stats.per_account || [];
+  const currencies = [...new Set([...accounts.map((a) => String(a.currency || '').toLowerCase()), ...rows.map((r) => String(r.currency || '').toLowerCase())].filter(Boolean))].sort();
+  if (!currencies.includes(state.analyticsCurrency)) {
+    state.analyticsCurrency = currencies.includes('usd') ? 'usd' : (currencies[0] || 'usd');
+    writePref('analyticsCurrency', state.analyticsCurrency);
+  }
+  const currency = state.analyticsCurrency;
+  const today = new Date();
+  const todayMs = Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate());
+  const stamp = (day) => Date.parse(`${day}T00:00:00Z`);
+  const currentStart = rangeDays ? todayMs - (rangeDays - 1) * DAY : -Infinity;
+  const previousStart = rangeDays ? currentStart - rangeDays * DAY : -Infinity;
+  const matching = rows.filter((row) => String(row.currency || '').toLowerCase() === currency);
+  const current = matching.filter((row) => stamp(row.day) >= currentStart && stamp(row.day) <= todayMs);
+  const previous = rangeDays ? matching.filter((row) => stamp(row.day) >= previousStart && stamp(row.day) < currentStart) : [];
+  const sum = (list, key) => list.reduce((total, row) => total + (Number(row[key]) || 0), 0);
+  const summarize = (list) => {
+    const sales = sum(list, 'sales');
+    const volume = sum(list, 'volume');
+    const disputes = sum(list, 'disputes');
+    return { sales, volume, disputes, refunded: sum(list, 'refunded'), refunds: sum(list, 'refunds'), declines: sum(list, 'declines'), average: sales ? volume / sales : 0, disputeRate: sales ? disputes / sales * 100 : null };
+  };
+  const now = summarize(current);
+  const before = summarize(previous);
+  const compare = (value, old, inverse = false) => {
+    if (!rangeDays) return '<span class="analytics-neutral">Complete recorded history</span>';
+    if (!old) return '<span class="analytics-neutral">No previous-period baseline</span>';
+    const change = (value - old) / Math.abs(old) * 100;
+    const positive = inverse ? change <= 0 : change >= 0;
+    return `<span class="analytics-delta ${positive ? 'positive' : 'negative'}">${change >= 0 ? '↑' : '↓'} ${Math.abs(change).toFixed(1)}%</span><span> vs previous period</span>`;
+  };
+
+  const byDay = new Map();
+  current.forEach((row) => {
+    const total = byDay.get(row.day) || { day: row.day, volume: 0, sales: 0, refunded: 0, disputes: 0 };
+    ['volume', 'sales', 'refunded', 'disputes'].forEach((key) => { total[key] += Number(row[key]) || 0; });
+    byDay.set(row.day, total);
+  });
+  const chartRows = [];
+  if (rangeDays) {
+    for (let index = 0; index < rangeDays; index++) {
+      const day = new Date(currentStart + index * DAY).toISOString().slice(0, 10);
+      chartRows.push(byDay.get(day) || { day, volume: 0, sales: 0, refunded: 0, disputes: 0 });
+    }
+  } else chartRows.push(...[...byDay.values()].sort((a, b) => a.day.localeCompare(b.day)));
+
+  const counts = {};
+  accounts.forEach((account) => { counts[account.health] = (counts[account.health] || 0) + 1; });
+  const bad = accounts.filter((account) => BAD.includes(account.health));
+  const needs = [...bad].sort((a, b) => HEALTH_ORDER.indexOf(a.health) - HEALTH_ORDER.indexOf(b.health));
+
+  root.innerHTML = `<div class="page analytics-page">
+    <section class="analytics-toolbar" aria-label="Analytics controls">
+      <div><span class="eyebrow">COMMERCE ANALYTICS</span><h2>Sales performance</h2><p>Daily Stripe results across connected accounts, separated by currency.</p></div>
+      <div class="analytics-controls">
+        <label class="currency-control"><span>Currency</span><select id="analytics-currency" aria-label="Analytics currency">${currencies.map((code) => `<option value="${esc(code)}" ${code === currency ? 'selected' : ''}>${esc(code.toUpperCase())}</option>`).join('')}</select></label>
+        <div class="range-switch" role="group" aria-label="Analytics date range">${[['7','7D'],['30','30D'],['90','90D'],['all','All time']].map(([value,label]) => `<button data-range="${value}" class="${state.analyticsRange === value ? 'active' : ''}" aria-pressed="${state.analyticsRange === value}">${label}</button>`).join('')}</div>
+      </div>
+    </section>
+    ${state.lastStall ? `<div class="warn-note crit analytics-notice"><b>Monitoring recovered</b> — one delayed check was released by the watchdog ${esc(ago(state.lastStall))}.</div>` : ''}
+
+    <div class="kpis analytics-kpis">
+      <article class="kpi analytics-primary"><div class="kpi-label">Gross volume · ${esc(rangeLabel)}</div><div class="kpi-val">${esc(money(now.volume, currency))}</div><div class="kpi-sub">${compare(now.volume, before.volume)}</div><canvas class="kpi-spark" data-spark="volume"></canvas></article>
+      <article class="kpi"><div class="kpi-label">Successful charges</div><div class="kpi-val good">${now.sales.toLocaleString()}</div><div class="kpi-sub">${compare(now.sales, before.sales)}</div><canvas class="kpi-spark" data-spark="sales"></canvas></article>
+      <article class="kpi"><div class="kpi-label">Average order value</div><div class="kpi-val">${esc(money(now.average, currency))}</div><div class="kpi-sub">${compare(now.average, before.average)}</div><canvas class="kpi-spark" data-spark="average"></canvas></article>
+      <article class="kpi"><div class="kpi-label">Refunded amount</div><div class="kpi-val ${now.refunded ? 'warn' : ''}">${esc(money(now.refunded, currency))}</div><div class="kpi-sub">${now.refunds} refund${now.refunds === 1 ? '' : 's'} · ${compare(now.refunded, before.refunded, true)}</div><canvas class="kpi-spark" data-spark="refunded"></canvas></article>
+      <article class="kpi"><div class="kpi-label">Dispute rate</div><div class="kpi-val ${now.disputeRate === null ? '' : now.disputeRate >= .75 ? 'crit' : now.disputeRate >= .4 ? 'warn' : 'good'}">${now.disputeRate === null ? '—' : `${now.disputeRate.toFixed(2)}<small>%</small>`}</div><div class="kpi-sub">${now.disputes} dispute${now.disputes === 1 ? '' : 's'} · ${compare(now.disputeRate || 0, before.disputeRate || 0, true)}</div><canvas class="kpi-spark" data-spark="disputes"></canvas></article>
+    </div>
+
+    <div class="analytics-balance" aria-label="Current operations snapshot">
+      <div><span>Available now</span><strong>${esc(moneyMap(state.totals.available, { compact: true }))}</strong></div>
+      <div><span>Pending balance</span><strong>${esc(moneyMap(state.totals.pending, { compact: true }))}</strong></div>
+      <div><span>Declined attempts</span><strong>${now.declines.toLocaleString()}</strong></div>
+      <div><span>Needs attention</span><strong class="${bad.length ? 'warn-text' : 'good-text'}">${bad.length} of ${accounts.length}</strong></div>
+    </div>
+
+    <div class="grid-2 analytics-grid"><div>
+      <div class="card analytics-chart-card"><div class="card-head"><div><span class="eyebrow">${esc(currency.toUpperCase())} · DAILY</span><h3>Gross sales over ${esc(rangeLabel.toLowerCase())}</h3></div><div class="spacer"></div><span class="analytics-total">${esc(money(now.volume, currency))}</span></div><div class="chart-wrap"><canvas id="main-chart" aria-label="Gross volume and successful charges over ${esc(rangeLabel.toLowerCase())}"></canvas><div class="chart-tip" id="chart-tip"></div></div><div class="chart-legend"><span><i style="background:var(--accent2)"></i>Gross volume</span><span><i style="background:var(--good)"></i>Successful charges (scaled)</span></div></div>
+      <div class="card"><div class="card-head"><h3>Fleet health</h3></div><div class="card-sub">${accounts.length} accounts. Select a segment to filter Accounts.</div><div class="fleet">${HEALTH_ORDER.filter((health) => counts[health]).map((health) => `<button class="fleet-seg" data-h="${health}" style="flex:${counts[health]}" title="${counts[health]} ${esc(HEALTH[health])}">${counts[health] > 1 ? counts[health] : ''}</button>`).join('')}</div><div class="fleet-key">${HEALTH_ORDER.filter((health) => counts[health]).map((health) => `<button data-key="${health}"><i class="fleet-seg" data-h="${health}"></i>${esc(HEALTH[health])} · ${counts[health]}</button>`).join('')}</div></div>
+    </div><div class="card"><div class="card-head"><h3>What needs you</h3></div><div class="card-sub">Highest-impact account issues first.</div>${needs.length ? `<div class="attn">${needs.slice(0,14).map((account) => `<button class="attn-row" data-open="${account.id}"><span class="hb hb-${esc(account.health)}">${esc(HEALTH[account.health] || account.health)}</span><span><span class="attn-name">${esc(account.label || 'unnamed')}</span><span class="attn-why">${esc(account.requirements || account.disabled_reason || account.last_error || groupName(account.group_id))}</span></span><span class="attn-right">${esc(ago(account.last_checked))}</span></button>`).join('')}${needs.length > 14 ? `<div class="side-note" style="padding:10px 12px">…and ${needs.length - 14} more</div>` : ''}</div>` : '<div class="empty" style="padding:34px"><b>All clear</b>Nothing is restricted, missing documents or unreachable.</div>'}</div></div>
+  </div>`;
+
+  const tip = $('#chart-tip');
+  const chart = $('#main-chart');
+  if (chart) areaChart(chart, chartRows, { valueKey: 'volume', lineKey: 'sales', tip, height: 230, color: css('--accent2'), lineColor: css('--good'), format: (value) => money(value, currency) });
+  $$('[data-spark]', root).forEach((canvas) => {
+    const key = canvas.dataset.spark;
+    const values = key === 'average' ? chartRows.map((row) => row.sales ? row.volume / row.sales : 0) : chartRows.map((row) => row[key] || 0);
+    const color = key === 'refunded' || key === 'disputes' ? css('--crit') : key === 'sales' ? css('--good') : css('--accent2');
+    sparkline(canvas, values, { color, height: 34 });
+  });
+  $$('[data-range]', root).forEach((button) => { button.onclick = async () => {
+    if (button.dataset.range === state.analyticsRange) return;
+    state.analyticsRange = button.dataset.range; writePref('analyticsRange', state.analyticsRange); root.setAttribute('aria-busy', 'true');
+    try { await loadStats(); root.removeAttribute('aria-busy'); render(); } catch (error) { root.removeAttribute('aria-busy'); toast(error.message, 'error'); }
+  }; });
+  $('#analytics-currency').onchange = (event) => { state.analyticsCurrency = event.target.value; writePref('analyticsCurrency', state.analyticsCurrency); render(); };
+  $$('.fleet-seg[data-h]', root).forEach((button) => { if (button.dataset.h && button.tagName === 'BUTTON') button.onclick = () => { state.healthFilter = button.dataset.h; state.tab = 'accounts'; render(); }; });
+  $$('.fleet-key [data-key]', root).forEach((button) => { button.onclick = () => { state.healthFilter = button.dataset.key; state.tab = 'accounts'; render(); }; });
+  $$('[data-open]', root).forEach((button) => { button.onclick = () => openCredentials(Number(button.dataset.open), 'login'); });
 }
 
 // ============================================================================
